@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-
-# Copyright (c) Twisted Matrix Laboratories.
-# See LICENSE for details.
-
 import sys
 
-from zope.interface import implementer
+from zope.interface import implementer, interface
 
 from twisted.conch import avatar, recvline
 from twisted.conch.insults import insults
@@ -15,13 +11,66 @@ from twisted.conch.ssh.transport import SSHServerTransport
 from twisted.cred import portal
 from twisted.cred.checkers import InMemoryUsernamePasswordDatabaseDontUse
 from twisted.internet import protocol, reactor
-from twisted.python import components, log
+from twisted.python import components, log, failure
 
-from typing import Callable, Any
+from typing import Callable, Any, Union
 
 from random import randint
 
 # log.startLogging(sys.stderr)
+
+__print__ = print
+NoneType = type(None)
+
+
+# Override default print to always flush, otherwise it doesn't show up in systemd logs
+def print(*args, **kwargs) -> None:
+    kwargs["flush"] = True
+    __print__(*args, **kwargs)
+
+
+def err(
+    _stuff: Union[NoneType, Exception, failure.Failure] = None,
+    _why: Union[str, NoneType] = None,
+    **kw,
+) -> None:
+    """Write a failure to the log.
+
+    The C{_stuff} and C{_why} parameters use an underscore prefix to lessen
+    the chance of colliding with a keyword argument the application wishes
+    to pass.  It is intended that they be supplied with arguments passed
+    positionally, not by keyword.
+
+    @param _stuff: The failure to log. If C{_stuff} is L{None} a new
+        L{Failure} will be created from the current exception state.  If
+        C{_stuff} is an C{Exception} instance it will be wrapped in a
+        L{Failure}.
+    @type _stuff: L{None}, C{Exception}, or L{Failure}.
+
+    @param _why: The source of this failure.  This will be logged along with
+        C{_stuff} and should describe the context in which the failure
+        occurred.
+    @type _why: C{str}
+    """
+    if _stuff is None:
+        _stuff = failure.Failure()
+    if isinstance(_stuff, failure.Failure):
+        # Hijack logging for ssh commands, the error has to be thrown to disconnect the user, and is perfectly safe to ignore
+        if (
+            _stuff.getErrorMessage()
+            != "'NoneType' object has no attribute 'loseConnection'"
+        ):
+            log.msg(failure=_stuff, why=_why, isError=1, **kw)
+        else:
+            log.msg("Ignoring failed ssh command", why=_why, isError=1, **kw)
+    elif isinstance(_stuff, Exception):
+        log.msg(failure=failure.Failure(_stuff), why=_why, isError=1, **kw)
+    else:
+        log.msg(repr(_stuff), why=_why, isError=1, **kw)
+
+
+log.deferr = err
+log.err = err
 
 """
 Example of running a custom protocol as a shell session over an SSH channel.
@@ -39,7 +88,7 @@ $ ckeygen -t rsa -f /opt/ssh-service-keys/keys/admin2
 $ ckeygen -t rsa -f /opt/ssh-service-keys/keys/guest
 
 Re-using DH primes and having such a short primes list is dangerous, generate
-your own primes.
+your own primes. Store your primes in "primes.py" under the variable name "PRIMES"
 
 In this example the implemented SSH server identifies itself using an RSA host
 key and authenticates clients using username "user" and password "password" or
@@ -68,11 +117,12 @@ GUEST_RSA_PUBLIC = KEY_DIR + "guest.pub"
 if len(sys.argv) < 2:
     raise ValueError("Script state must be passed as first arg.")
 __state__ = sys.argv[1]
-states = {
+commonCmds = ["help", "clear", "quit", "exit", "cd", "null"]
+states: dict[str, dict[str, Any]] = {
     "universe": {
         "port": 22,
         "motd": [
-            f"CONNECTED TO UNIVERSAL NODE {randint(0, 999)}",
+            "CONNECTED TO UNIVERSAL NODE $RNDID",
             "",
             "FOR OFFICIAL USE ONLY.",
             "",
@@ -80,6 +130,7 @@ states = {
             "",
             "Due to technical restrictions, ^C and ^D do not work on this server.",
         ],
+        "cmds": ["uptime"],
     },
     "space": {
         "port": 22,
@@ -92,6 +143,7 @@ states = {
             "",
             "Due to technical restrictions, ^C and ^D do not work on this server.",
         ],
+        "cmds": ["status"],
     },
     "test": {
         "port": 5022,
@@ -100,8 +152,11 @@ states = {
             "",
             "Due to technical restrictions, ^C and ^D do not work on this server.",
         ],
+        "cmds": ["debug"],
     },
 }
+for state in states:
+    states[state]["cmds"].extend(commonCmds)
 if __state__ not in states:
     raise ValueError(f"Invalid state. Must be one of: {list(states.keys())}")
 
@@ -133,7 +188,9 @@ from primes import PRIMES
 
 
 class SshAvatar(avatar.ConchUser):
-    def __init__(self, username):
+    username: bytes
+
+    def __init__(self, username: bytes):
         avatar.ConchUser.__init__(self)
         self.username = username
         self.channelLookup.update({b"session": session.SSHSession})
@@ -141,7 +198,9 @@ class SshAvatar(avatar.ConchUser):
 
 @implementer(portal.IRealm)
 class SshRealm:
-    def requestAvatar(self, avatarId, mind, *interfaces):
+    def requestAvatar(
+        self, avatarId: bytes, mind, *interfaces: tuple[interface.InterfaceClass]
+    ):
         return interfaces[0], SshAvatar(avatarId), lambda: None
 
 
@@ -154,41 +213,43 @@ class SshSession:
     windowSize: tuple[int]
     ptyAttrs: list[tuple[int]]
 
-    def __init__(self, avatar):
+    def __init__(self, avatar: SshAvatar):
         self.avatar = avatar
         self.username = avatar.username.decode()
 
-    def getPty(self, term, windowSize, attrs):
+    def getPty(
+        self, term: bytes, windowSize: tuple[int], attrs: list[tuple[int]]
+    ) -> None:
         self.term = term
         self.windowSize = windowSize
         self.ptyAttrs = attrs
 
-    def setEnv(self, name, value):
+    def setEnv(self, name: bytes, value: bytes) -> None:
         self.env[name] = value
 
-    def execCommand(self, proto, cmd):
+    def execCommand(self, proto: session.SSHSessionProcessProtocol, cmd: bytes) -> None:
         """
         We don't support command execution sessions.
         """
         proto.write("Nice try\r\n")
         proto.loseConnection()  # This errors, but honestly that's fine. Causes the user to get dropped from the server, which is what we want this to do anyways.
 
-    def windowChanged(self, windowSize):
+    def windowChanged(self, windowSize: tuple[int]) -> None:
         self.windowSize = windowSize
 
-    def openShell(self, transport):
+    def openShell(self, transport: session.SSHSessionProcessProtocol) -> None:
         protocol = insults.ServerProtocol(SshProtocol, self)
         protocol.makeConnection(transport)
         transport.makeConnection(session.wrapProtocol(protocol))
 
-    def eofReceived(self): ...
+    def eofReceived(self) -> None: ...
 
-    def closed(self): ...
+    def closed(self) -> None: ...
 
 
 class SshProtocol(recvline.HistoricRecvLine):
     cmdMap: dict[str, Callable[[Any, list[str]], bool]] = {}
-    helpMap: dict[str, dict[str, Any]] = {
+    helpMap: dict[str, dict[str, Union[str, list[str]]]] = {
         "help": {
             "desc": "Provides help with availible commands",
             "usage": ["help", "help <command>"],
@@ -197,29 +258,67 @@ class SshProtocol(recvline.HistoricRecvLine):
         "quit": {"desc": "Closes the connection", "usage": ["quit", "exit"]},
         "exit": {"desc": "Closes the connection", "usage": ["exit", "quit"]},
         "cd": {"desc": "Changes the current directory", "usage": ["cd <directory>"]},
+        "uptime": {
+            "desc": "Displays the current node's system uptime",
+            "usage": ["uptime"],
+        },
+        "status": {"desc": "Displays the current system status", "usage": ["status"]},
     }
     user: SshSession = ...
     username: str = ...
 
-    def __init__(self, user):
+    def __init__(self, user: SshSession):
         self.user = user
         self.username = user.username
-        self.cmdMap = {
-            "help": self.help,
-            "clear": self.clear,
-            "quit": self.quit,
-            "exit": self.quit,
-            "cd": self.cd,
-        }
+        for cmd in states[__state__]["cmds"]:
+            try:
+                self.cmdMap[cmd] = getattr(self, cmd)
+            except ValueError:
+                self.cmdMap[cmd] = self.null
         print(f'Initalized new terminal for user "{user.username}"')
 
     # Commands
+
+    def null(self, params) -> bool:
+        self.writeLines(["Command not implemented"])
+        return True
+
+    def uptime(self, params) -> bool:
+        self.writeLines(
+            [
+                "!!! NOTICE !!!",
+                "Due to exceeding bit limits, the system uptime on this node is aproximate.",
+                "",
+                "Uptime: ~13.8 Billion Years",
+            ]
+        )
+        return True
+
+    def status(self, params) -> bool:
+        self.writeLines(
+            [
+                "=== System status ===",
+                "",
+                "Current power reserves: 12y 5m 3d 9h 3m 21s",
+                "Lighting status: In direct sunlight",
+                "Incoming power: +4683MW",
+                "System load: Minimal",
+                "System power draw: -4683MW",
+                "Net power gain/loss: 0W",
+                "",
+                "Overall status: OK.",
+            ]
+        )
+        return True
 
     def clear(self, params) -> bool:
         self.terminal.reset()
         return False
 
     def quit(self, params) -> bool:
+        self.terminal.loseConnection()
+
+    def exit(self, params) -> bool:
         self.terminal.loseConnection()
 
     def help(self, params):
@@ -230,9 +329,12 @@ class SshProtocol(recvline.HistoricRecvLine):
         else:
             cmd = params[0]
             if cmd in self.cmdMap:
-                myHelp = self.helpMap[params[0]]
-                h.extend([f"Help for {params[0]}", myHelp["desc"], "", "Usage:"])
-                h.extend(myHelp["usage"])
+                if cmd in self.helpMap:
+                    myHelp = self.helpMap[params[0]]
+                    h.extend([f"Help for {params[0]}", myHelp["desc"], "", "Usage:"])
+                    h.extend(myHelp["usage"])
+                else:
+                    h.append("Command not implemented")
             else:
                 h.extend(
                     [
@@ -257,7 +359,14 @@ class SshProtocol(recvline.HistoricRecvLine):
             if firstNew:
                 self.terminal.nextLine()
             firstNew = True
-            self.terminal.write(line)
+            id = randint(0, 999)
+            if id < 10:
+                id = f"00{id}"
+            elif id < 100:
+                id = f"0{id}"
+            else:
+                id = f"{id}"
+            self.terminal.write(line.replace("$RNDID", id))
 
     def connectionMade(self):
         recvline.HistoricRecvLine.connectionMade(self)
