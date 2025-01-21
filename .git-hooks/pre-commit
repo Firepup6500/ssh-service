@@ -1,0 +1,7 @@
+#!/bin/bash
+
+echo "Running pre-commit hook"
+pre-commit run -a
+git diff --name-only --cached | xargs git add
+echo "Re-running pre-commit hook, to check for actual (non-formatting) errors"
+pre-commit run -a
