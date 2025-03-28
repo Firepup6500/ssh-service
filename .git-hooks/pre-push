@@ -1,0 +1,8 @@
+if [ -z "$(git status --porcelain)" ];then
+  echo No uncommited changes detected
+else
+  echo The following files have uncommited changes:
+  git status --porcelain
+  echo Refusing to push
+  exit 1
+fi
